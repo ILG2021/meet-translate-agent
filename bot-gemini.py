@@ -25,6 +25,8 @@ import yaml
 from dotenv import load_dotenv
 from loguru import logger
 from PIL import Image
+from pipecat.transcriptions.language import Language
+
 from runner import configure
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
@@ -42,7 +44,8 @@ from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.processors.frameworks.rtvi import RTVIConfig, RTVIObserver, RTVIProcessor
-from pipecat.services.gemini_multimodal_live.gemini import GeminiMultimodalLiveLLMService
+from pipecat.services.gemini_multimodal_live.gemini import GeminiMultimodalLiveLLMService, InputParams, \
+    GeminiMultimodalModalities
 from pipecat.transports.services.daily import DailyParams, DailyTransport
 
 load_dotenv(override=True)
@@ -145,23 +148,23 @@ async def main():
             ),
         )
 
+
         # Initialize the Gemini Multimodal Live model
         llm = GeminiMultimodalLiveLLMService(
             api_key=os.getenv("GEMINI_API_KEY"),
             voice_id="Puck",  # Aoede, Charon, Fenrir, Kore, Puck
             transcribe_user_audio=True,
+            system_instruction=read_prompt_from_yaml("./config.yaml"),
+            params=InputParams(
+                temperature=0.7,  # Set model input params
+                language=Language.ZH_CN,  # Set language (30+ languages supported)
+                modalities=GeminiMultimodalModalities.AUDIO  # Response modality
+            )
         )
-
-        messages = [
-            {
-                "role": "user",
-                "content": read_prompt_from_yaml("./config.yaml"),
-            },
-        ]
 
         # Set up conversation context and management
         # The context_aggregator will automatically collect conversation context
-        context = OpenAILLMContext(messages)
+        context = OpenAILLMContext()
         context_aggregator = llm.create_context_aggregator(context)
 
         ta = TalkingAnimation()
