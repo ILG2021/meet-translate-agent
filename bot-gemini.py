@@ -27,6 +27,8 @@ from loguru import logger
 from PIL import Image
 from pipecat.transcriptions.language import Language
 
+from gemini_live import GeminiMultimodalLiveLLMService
+from gemini_live.gemini import InputParams, GeminiMultimodalModalities
 from runner import configure
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
@@ -44,8 +46,6 @@ from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.processors.frameworks.rtvi import RTVIConfig, RTVIObserver, RTVIProcessor
-from pipecat.services.gemini_multimodal_live.gemini import GeminiMultimodalLiveLLMService, InputParams, \
-    GeminiMultimodalModalities
 from pipecat.transports.services.daily import DailyParams, DailyTransport
 
 load_dotenv(override=True)
@@ -153,7 +153,7 @@ async def main():
         llm = GeminiMultimodalLiveLLMService(
             api_key=os.getenv("GEMINI_API_KEY"),
             voice_id="Puck",  # Aoede, Charon, Fenrir, Kore, Puck
-            transcribe_user_audio=True,
+            transcribe_user_audio=False,
             system_instruction=read_prompt_from_yaml("./config.yaml"),
             params=InputParams(
                 temperature=0.7,  # Set model input params
@@ -194,6 +194,7 @@ async def main():
                 enable_usage_metrics=True,
             ),
             observers=[RTVIObserver(rtvi)],
+            cancel_on_idle_timeout=False
         )
         await task.queue_frame(quiet_frame)
 
