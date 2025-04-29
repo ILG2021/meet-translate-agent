@@ -4,15 +4,18 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
-import argparse
+import asyncio
 import os
 from dataclasses import dataclass
 
+import aiohttp
 import google.ai.generativelanguage as glm
+import lingua
 from dotenv import load_dotenv
+from lingua import LanguageDetectorBuilder
 from loguru import logger
-
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import (
     Frame,
     InputAudioRawFrame,
@@ -22,22 +25,22 @@ from pipecat.frames.frames import (
     TextFrame,
     TranscriptionFrame,
     UserStartedSpeakingFrame,
-    UserStoppedSpeakingFrame,
+    UserStoppedSpeakingFrame, TTSUpdateSettingsFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
 from pipecat.processors.frame_processor import FrameProcessor
-from pipecat.services.google.llm import GoogleLLMService
+from pipecat.services.google.llm import GoogleLLMService, GoogleLLMContext
 from pipecat.services.google.tts import GoogleTTSService
 from pipecat.transcriptions.language import Language
-from pipecat.transports.base_transport import TransportParams
-from pipecat.transports.network.small_webrtc import SmallWebRTCTransport
-from pipecat.transports.network.webrtc_connection import SmallWebRTCConnection
+from pipecat.transports.services.daily import DailyTransport, DailyParams
+
+from runner import configure
+from util import read_prompt_from_yaml
 
 load_dotenv(override=True)
-
 
 marker = "|----|"
 system_message = f"""
@@ -63,6 +66,8 @@ You: How many ounces are in a pound?
 There are 16 ounces in a pound.
 """
 
+detector = LanguageDetectorBuilder.from_all_languages().with_preloaded_language_models().build()
+
 
 @dataclass
 class MagicDemoTranscriptionFrame(Frame):
@@ -70,10 +75,11 @@ class MagicDemoTranscriptionFrame(Frame):
 
 
 class UserAudioCollector(FrameProcessor):
-    def __init__(self, context, user_context_aggregator):
+    def __init__(self):
         super().__init__()
-        self._context = context
-        self._user_context_aggregator = user_context_aggregator
+        self.system_prompt = read_prompt_from_yaml("./config.yaml")
+        self._context = GoogleLLMContext.upgrade_to_google(
+            OpenAILLMContext([{"role": "system", "content": self.system_prompt}]))
         self._audio_frames = []
         self._start_secs = 0.2  # this should match VAD start_secs (hardcoding for now)
         self._user_speaking = False
@@ -89,10 +95,13 @@ class UserAudioCollector(FrameProcessor):
             self._user_speaking = True
         elif isinstance(frame, UserStoppedSpeakingFrame):
             self._user_speaking = False
+            # 添加音频到上下文
             self._context.add_audio_frames_message(audio_frames=self._audio_frames)
-            await self._user_context_aggregator.push_frame(
-                self._user_context_aggregator.get_context_frame()
-            )
+            # 推送 LLMContextFrame 给 llm
+            await self.push_frame(self._context.get_context_frame(), direction)
+            # 清空缓冲区并重置上下文（无历史）
+            self._audio_frames = []
+            self._context.set_messages([])
         elif isinstance(frame, InputAudioRawFrame):
             if self._user_speaking:
                 self._audio_frames.append(frame)
@@ -109,99 +118,75 @@ class UserAudioCollector(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
-class TranscriptExtractor(FrameProcessor):
-    def __init__(self, context):
+class LanguageDetector(FrameProcessor):
+    def __init__(self):
         super().__init__()
-        self._context = context
         self._accumulator = ""
-        self._processing_llm_response = False
         self._accumulating_transcript = False
+        self.lang_map = {
+            lingua.Language.CHINESE: Language.ZH_CN,
+            lingua.Language.ENGLISH: Language.EN_US,
+            lingua.Language.FRENCH: Language.FR_FR,
+            lingua.Language.PORTUGUESE: Language.PT_PT,
+            lingua.Language.INDONESIAN: Language.ID,
+            lingua.Language.TAGALOG: Language.TL,
+            lingua.Language.VIETNAMESE: Language.VI,
+            lingua.Language.SPANISH:Language.ES_ES
+        }
 
     def reset(self):
         self._accumulator = ""
-        self._processing_llm_response = False
         self._accumulating_transcript = False
 
     async def process_frame(self, frame, direction):
         await super().process_frame(frame, direction)
         if isinstance(frame, LLMFullResponseStartFrame):
-            self._processing_llm_response = True
             self._accumulating_transcript = True
-        elif isinstance(frame, TextFrame) and self._processing_llm_response:
+        elif isinstance(frame, TextFrame):
             if self._accumulating_transcript:
-                text = frame.text
-                split_index = text.find(marker)
-                if split_index < 0:
-                    self._accumulator += frame.text
-                    # do not push this frame
-                    return
-                else:
-                    self._accumulating_transcript = False
-                    self._accumulator += text[:split_index]
-                    frame.text = text[split_index + len(marker) :]
-            await self.push_frame(frame)
+                self._accumulator += frame.text
             return
         elif isinstance(frame, LLMFullResponseEndFrame):
-            await self.push_frame(MagicDemoTranscriptionFrame(text=self._accumulator.strip()))
+            text = self._accumulator.strip()
+            lang = detector.detect_language_of(text).language.name
+
+            await self.push_frame(TTSUpdateSettingsFrame({
+                "language": self.lang_map[lang]
+            }))
+            await self.push_frame(TextFrame(text=text))
             self.reset()
 
         await self.push_frame(frame, direction)
 
 
-class TanscriptionContextFixup(FrameProcessor):
-    def __init__(self, context):
-        super().__init__()
-        self._context = context
-        self._transcript = "THIS IS A TRANSCRIPT"
+async def main():
+    """Main bot execution function.
 
-    def swap_user_audio(self):
-        if not self._transcript:
-            return
-        message = self._context.messages[-2]
-        last_part = message.parts[-1]
-        if (
-            message.role == "user"
-            and last_part.inline_data
-            and last_part.inline_data.mime_type == "audio/wav"
-        ):
-            self._context.messages[-2] = glm.Content(
-                role="user", parts=[glm.Part(text=self._transcript)]
-            )
+    Sets up and runs the bot pipeline including:
+    - Daily video transport with specific audio parameters
+    - Gemini Live multimodal model integration
+    - Voice activity detection
+    - Animation processing
+    - RTVI event handling
+    """
+    async with aiohttp.ClientSession() as session:
+        (room_url, token) = await configure(session)
 
-    def add_transcript_back_to_inference_output(self):
-        if not self._transcript:
-            return
-        message = self._context.messages[-1]
-        last_part = message.parts[-1]
-        if message.role == "model" and last_part.text:
-            self._context.messages[-1].parts[-1].text += f"\n\n{marker}\n{self._transcript}\n"
-
-    async def process_frame(self, frame, direction):
-        await super().process_frame(frame, direction)
-
-        if isinstance(frame, MagicDemoTranscriptionFrame):
-            self._transcript = frame.text
-        elif isinstance(frame, LLMFullResponseEndFrame) or isinstance(
-            frame, StartInterruptionFrame
-        ):
-            self.swap_user_audio()
-            self.add_transcript_back_to_inference_output()
-            self._transcript = ""
-
-        await self.push_frame(frame, direction)
-
-
-async def run_bot(webrtc_connection: SmallWebRTCConnection, _: argparse.Namespace):
-    logger.info(f"Starting bot")
-
-    transport = SmallWebRTCTransport(
-        webrtc_connection=webrtc_connection,
-        params=TransportParams(
-            audio_in_enabled=True,
-            audio_out_enabled=True,
-            vad_analyzer=SileroVADAnalyzer(),
-        ),
-    )
+        # Set up Daily transport with specific audio/video parameters for Gemini
+        transport = DailyTransport(
+            room_url,
+            token,
+            "Translator",
+            DailyParams(
+                audio_out_enabled=True,
+                camera_out_enabled=True,
+                camera_out_width=1024,
+                camera_out_height=576,
+                vad_enabled=True,
+                vad_audio_passthrough=True,
+                vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.5)),
+            ),
+        )
 
     llm = GoogleLLMService(api_key=os.getenv("GOOGLE_API_KEY"), model="gemini-2.0-flash-001")
 
@@ -216,29 +201,18 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection, _: argparse.Namespac
             "role": "system",
             "content": system_message,
         },
-        {
-            "role": "user",
-            "content": "Start by saying hello.",
-        },
     ]
 
-    context = OpenAILLMContext(messages)
-    context_aggregator = llm.create_context_aggregator(context)
-    audio_collector = UserAudioCollector(context, context_aggregator.user())
-    pull_transcript_out_of_llm_output = TranscriptExtractor(context)
-    fixup_context_messages = TanscriptionContextFixup(context)
-
+    audio_collector = UserAudioCollector()
+    language_detector = LanguageDetector()
     pipeline = Pipeline(
         [
             transport.input(),  # Transport user input
             audio_collector,
-            context_aggregator.user(),  # User responses
             llm,  # LLM
-            pull_transcript_out_of_llm_output,
+            language_detector,
             tts,  # TTS
             transport.output(),  # Transport bot output
-            context_aggregator.assistant(),  # Assistant spoken responses
-            fixup_context_messages,
         ]
     )
 
@@ -251,21 +225,16 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection, _: argparse.Namespac
         ),
     )
 
-    @transport.event_handler("on_client_connected")
-    async def on_client_connected(transport, client):
-        logger.info(f"Client connected")
-        # Kick off the conversation.
-        messages.append({"role": "system", "content": "Please introduce yourself to the user."})
-        await task.queue_frames([context_aggregator.user().get_context_frame()])
-
-    @transport.event_handler("on_client_disconnected")
-    async def on_client_disconnected(transport, client):
-        logger.info(f"Client disconnected")
-
-    @transport.event_handler("on_client_closed")
-    async def on_client_closed(transport, client):
-        logger.info(f"Client closed connection")
-        await task.cancel()
+    # @transport.event_handler("on_client_connected")
+    # async def on_client_connected(transport, client):
+    #     logger.info(f"Client connected")
+    #     # Kick off the conversation.
+    #     messages.append({"role": "system", "content": "Please introduce yourself to the user."})
+    #     await task.queue_frames([context_aggregator.user().get_context_frame()])
+    #
+    # @transport.event_handler("on_client_disconnected")
+    # async def on_client_disconnected(transport, client):
+    #     logger.info(f"Client disconnected")
 
     runner = PipelineRunner(handle_sigint=False)
 
@@ -273,6 +242,4 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection, _: argparse.Namespac
 
 
 if __name__ == "__main__":
-    from run import main
-
-    main()
+    asyncio.run(main())

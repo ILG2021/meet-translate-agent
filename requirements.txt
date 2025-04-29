@@ -1,4 +1,5 @@
 python-dotenv
 fastapi[all]
 uvicorn
-pipecat-ai[daily,silero,google]
+pipecat-ai[daily,silero,google,openai]
+ lingua-language-detector
