@@ -25,10 +25,10 @@ import yaml
 from dotenv import load_dotenv
 from loguru import logger
 from PIL import Image
+from pipecat.services.gemini_multimodal_live import GeminiMultimodalLiveLLMService
+from pipecat.services.gemini_multimodal_live.gemini import InputParams, GeminiMultimodalModalities
 from pipecat.transcriptions.language import Language
 
-from gemini_live import GeminiMultimodalLiveLLMService
-from gemini_live.gemini import InputParams, GeminiMultimodalModalities
 from runner import configure
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
@@ -194,7 +194,6 @@ async def main():
                 enable_usage_metrics=True,
             ),
             observers=[RTVIObserver(rtvi)],
-            cancel_on_idle_timeout=False
         )
         await task.queue_frame(quiet_frame)
 
