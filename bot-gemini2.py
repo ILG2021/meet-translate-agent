@@ -32,8 +32,9 @@ from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
 from pipecat.processors.frame_processor import FrameProcessor
+from pipecat.processors.frameworks.rtvi import RTVIProcessor, RTVIConfig
 from pipecat.services.google.llm import GoogleLLMService, GoogleLLMContext
-from pipecat.services.google.tts import GoogleTTSService
+from pipecat.services.google.tts import GoogleTTSService, language_to_google_tts_language
 from pipecat.transcriptions.language import Language
 from pipecat.transports.services.daily import DailyTransport, DailyParams
 
@@ -51,11 +52,10 @@ class MagicDemoTranscriptionFrame(Frame):
 
 
 class UserAudioCollector(FrameProcessor):
-    def __init__(self):
+    def __init__(self,context, context_aggregator_user):
         super().__init__()
-        self.system_prompt = read_prompt_from_yaml("./config.yaml")
-        self._context = GoogleLLMContext.upgrade_to_google(
-            OpenAILLMContext([{"role": "system", "content": self.system_prompt}]))
+        self._context = context
+        self._context_aggregator_user = context_aggregator_user
         self._audio_frames = []
         self._start_secs = 0.2  # this should match VAD start_secs (hardcoding for now)
         self._user_speaking = False
@@ -74,10 +74,11 @@ class UserAudioCollector(FrameProcessor):
             # 添加音频到上下文
             self._context.add_audio_frames_message(audio_frames=self._audio_frames)
             # 推送 LLMContextFrame 给 llm
-            await self.push_frame(self._context.get_context_frame(), direction)
+            await self._context_aggregator_user.push_frame(
+                self._context_aggregator_user.get_context_frame()
+            )
             # 清空缓冲区并重置上下文（无历史）
             self._audio_frames = []
-            self._context.set_messages([])
         elif isinstance(frame, InputAudioRawFrame):
             if self._user_speaking:
                 self._audio_frames.append(frame)
@@ -95,9 +96,10 @@ class UserAudioCollector(FrameProcessor):
 
 
 class LanguageDetector(FrameProcessor):
-    def __init__(self):
+    def __init__(self,context):
         super().__init__()
         self._accumulator = ""
+        self._context = context
         self._accumulating_transcript = False
         self.lang_map = {
             lingua.Language.CHINESE: Language.ZH_CN,
@@ -113,6 +115,7 @@ class LanguageDetector(FrameProcessor):
     def reset(self):
         self._accumulator = ""
         self._accumulating_transcript = False
+        self._context.set_messages([])
 
     async def process_frame(self, frame, direction):
         await super().process_frame(frame, direction)
@@ -124,10 +127,11 @@ class LanguageDetector(FrameProcessor):
             return
         elif isinstance(frame, LLMFullResponseEndFrame):
             text = self._accumulator.strip()
-            lang = detector.detect_language_of(text).language.name
+            lang = detector.detect_language_of(text)
 
             await self.push_frame(TTSUpdateSettingsFrame({
-                "language": self.lang_map[lang]
+                "language": self.lang_map[lang],
+                "voice": language_to_google_tts_language(self.lang_map[lang]) + "-Standard-A"
             }))
             await self.push_frame(TextFrame(text=text))
             self.reset()
@@ -152,10 +156,10 @@ async def main():
         transport = DailyTransport(
             room_url,
             token,
-            "Translator",
+            "翻译助手",
             DailyParams(
                 audio_out_enabled=True,
-                camera_out_enabled=True,
+                camera_out_enabled=False,
                 camera_out_width=1024,
                 camera_out_height=576,
                 vad_enabled=True,
@@ -165,21 +169,25 @@ async def main():
         )
 
     llm = GoogleLLMService(api_key=os.getenv("GOOGLE_API_KEY"), model="gemini-2.0-flash-001")
-    context = OpenAILLMContext([{"role": "system", "content": self.system_prompt}])
-    context_aggregator = llm.create_context_aggregator(context)
+    context = OpenAILLMContext([{"role": "system", "content": read_prompt_from_yaml("./config.yaml")}])
+    context_aggregator_user = llm.create_context_aggregator(context).user()
 
     tts = GoogleTTSService(
-        voice_id="en-US-Chirp3-HD-Charon",
+        voice_id="en-US-Standard-A",
         params=GoogleTTSService.InputParams(language=Language.EN_US),
         credentials=os.getenv("GOOGLE_TEST_CREDENTIALS"),
     )
 
-    audio_collector = UserAudioCollector()
-    language_detector = LanguageDetector()
+    audio_collector = UserAudioCollector(context, context_aggregator_user)
+    language_detector = LanguageDetector(context)
+    rtvi = RTVIProcessor(config=RTVIConfig(config=[]))
+
     pipeline = Pipeline(
         [
             transport.input(),  # Transport user input
+            rtvi,
             audio_collector,
+            context_aggregator_user,
             llm,  # LLM
             language_detector,
             tts,  # TTS
@@ -196,16 +204,19 @@ async def main():
         ),
     )
 
-    # @transport.event_handler("on_client_connected")
-    # async def on_client_connected(transport, client):
-    #     logger.info(f"Client connected")
-    #     # Kick off the conversation.
-    #     messages.append({"role": "system", "content": "Please introduce yourself to the user."})
-    #     await task.queue_frames([context_aggregator.user().get_context_frame()])
-    #
-    # @transport.event_handler("on_client_disconnected")
-    # async def on_client_disconnected(transport, client):
-    #     logger.info(f"Client disconnected")
+    @rtvi.event_handler("on_client_ready")
+    async def on_client_ready(rtvi):
+        await rtvi.set_bot_ready()
+        await task.queue_frames([context_aggregator_user.get_context_frame()])
+
+    @transport.event_handler("on_first_participant_joined")
+    async def on_first_participant_joined(transport, participant):
+        await transport.capture_participant_transcription(participant["id"])
+
+    @transport.event_handler("on_participant_left")
+    async def on_participant_left(transport, participant, reason):
+        print(f"Participant left: {participant}")
+        # await task.cancel()
 
     runner = PipelineRunner(handle_sigint=False)
 
