@@ -63,6 +63,7 @@ async def main():
         )
 
         llm = OpenAIRealtimeBetaLLMService(
+            model="gpt-4o-mini-realtime-preview-2024-12-17",
             api_key=os.getenv("OPENAI_API_KEY"),
             session_properties=session_properties,
             start_audio_paused=False,

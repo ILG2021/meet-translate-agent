@@ -42,30 +42,6 @@ from util import read_prompt_from_yaml
 
 load_dotenv(override=True)
 
-marker = "|----|"
-system_message = f"""
-You are a helpful LLM in a WebRTC call. Your goals are to be helpful and brief in your responses.
-
-You are expert at transcribing audio to text. You will receive a mixture of audio and text input. When
-asked to transcribe what the user said, output an exact, word-for-word transcription.
-
-Your output will be converted to audio so don't include special characters in your answers.
-
-Each time you answer, you should respond in three parts.
-
-1. Transcribe exactly what the user said.
-2. Output the separator field '{marker}'.
-3. Respond to the user's input in a helpful, creative way using only simple text and punctuation.
-
-Example:
-
-User: How many ounces are in a pound?
-
-You: How many ounces are in a pound?
-{marker}
-There are 16 ounces in a pound.
-"""
-
 detector = LanguageDetectorBuilder.from_all_languages().with_preloaded_language_models().build()
 
 
@@ -189,19 +165,14 @@ async def main():
         )
 
     llm = GoogleLLMService(api_key=os.getenv("GOOGLE_API_KEY"), model="gemini-2.0-flash-001")
+    context = OpenAILLMContext([{"role": "system", "content": self.system_prompt}])
+    context_aggregator = llm.create_context_aggregator(context)
 
     tts = GoogleTTSService(
         voice_id="en-US-Chirp3-HD-Charon",
         params=GoogleTTSService.InputParams(language=Language.EN_US),
         credentials=os.getenv("GOOGLE_TEST_CREDENTIALS"),
     )
-
-    messages = [
-        {
-            "role": "system",
-            "content": system_message,
-        },
-    ]
 
     audio_collector = UserAudioCollector()
     language_detector = LanguageDetector()
