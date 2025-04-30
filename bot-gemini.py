@@ -25,10 +25,10 @@ import yaml
 from dotenv import load_dotenv
 from loguru import logger
 from PIL import Image
-from pipecat.services.gemini_multimodal_live import GeminiMultimodalLiveLLMService
-from pipecat.services.gemini_multimodal_live.gemini import InputParams, GeminiMultimodalModalities
 from pipecat.transcriptions.language import Language
 
+from gemini_multimodal_live import GeminiMultimodalLiveLLMService
+from gemini_multimodal_live.gemini import InputParams, GeminiMultimodalModalities, ContextWindowCompressionParams
 from runner import configure
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
@@ -108,7 +108,6 @@ class TalkingAnimation(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
-
 async def main():
     """Main bot execution function.
 
@@ -138,7 +137,6 @@ async def main():
             ),
         )
 
-
         # Initialize the Gemini Multimodal Live model
         llm = GeminiMultimodalLiveLLMService(
             api_key=os.getenv("GEMINI_API_KEY"),
@@ -148,7 +146,8 @@ async def main():
             params=InputParams(
                 temperature=0.7,  # Set model input params
                 language=Language.ZH_CN,  # Set language (30+ languages supported)
-                modalities=GeminiMultimodalModalities.AUDIO  # Response modality
+                modalities=GeminiMultimodalModalities.AUDIO,  # Response modality
+                context_window_compression=ContextWindowCompressionParams(enabled=True)
             )
         )
 
@@ -184,6 +183,7 @@ async def main():
                 enable_usage_metrics=True,
             ),
             observers=[RTVIObserver(rtvi)],
+            cancel_on_idle_timeout=False
         )
         await task.queue_frame(quiet_frame)
 
